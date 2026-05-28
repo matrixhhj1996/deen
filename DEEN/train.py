@@ -51,9 +51,18 @@ parser.add_argument('--lambda_2', default=0.01, type=float, help='lambda_2')
 # Applied on the *original* DEE chunk (ft1) only — augmented chunks ft2/ft3
 # would pollute per-class σ estimates with DEE augmentation noise.
 parser.add_argument('--ccswd_weight', default=0.0, type=float,
-                    help='Weight of class-conditional SWD loss (0 disables).')
+                    help='Fixed weight of class-conditional SWD loss (0 disables). '
+                         'Ignored when --ccswd_learnable is set.')
 parser.add_argument('--ccswd_projections', default=64, type=int,
                     help='L = number of random projections for SWD.')
+parser.add_argument('--ccswd_learnable', action='store_true',
+                    help='Use Kendall-style uncertainty weighting (CVPR 2018): '
+                         'L_weighted = 0.5*exp(-log_var)*L_ccswd + 0.5*log_var. '
+                         'Auto-balances the contribution; principled and provides '
+                         'diagnostic value (final log_var tells us the natural weight).')
+parser.add_argument('--ccswd_init_logvar', default=-5.3, type=float,
+                    help='Init for log σ² when --ccswd_learnable. Default -5.3 → '
+                         'initial effective weight ≈ 100, matching the manual estimate.')
 parser.add_argument('--tag', default='', type=str,
                     help='Run suffix appended to log filename for ablation bookkeeping.')
 
@@ -231,6 +240,11 @@ loader_batch = args.batch_size * args.num_pos
 criterion_tri= OriTripletLoss(batch_size=loader_batch, margin=args.margin)
 criterion_cpm= CPMLoss(margin=0.2)
 criterion_ccswd = ClassCondSWDLoss(n_projections=args.ccswd_projections)
+# Learnable log_var for Kendall-style uncertainty weighting of ccswd.
+# Only used when --ccswd_learnable. Lives outside `net` so it's not part of
+# state_dict (cleaner checkpointing); a single scalar parameter.
+ccswd_logvar = nn.Parameter(torch.tensor(args.ccswd_init_logvar, device=device),
+                            requires_grad=args.ccswd_learnable)
 
 criterion_id.to(device)
 criterion_tri.to(device)
@@ -248,6 +262,12 @@ if args.optim == 'sgd':
         {'params': net.bottleneck.parameters(), 'lr': args.lr},
         {'params': net.classifier.parameters(), 'lr': args.lr}],
         weight_decay=5e-4, momentum=0.9, nesterov=True)
+    # Add learnable log_var as its own param group: no weight_decay (we don't want
+    # L2 fighting Kendall's regularizer log(σ²)) and slightly lower LR for stability.
+    if args.ccswd_learnable:
+        optimizer.add_param_group({'params': [ccswd_logvar],
+                                   'lr': 0.1 * args.lr,
+                                   'weight_decay': 0.0})
 
 # exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 def adjust_learning_rate(optimizer, epoch):
@@ -272,6 +292,9 @@ def adjust_learning_rate(optimizer, epoch):
 def train(epoch):
 
     current_lr = adjust_learning_rate(optimizer, epoch)
+    # Hoist use_ccswd to function scope so post-loop writer can reference it
+    # even if trainloader is somehow empty.
+    use_ccswd = args.ccswd_weight > 0 or args.ccswd_learnable
     train_loss = AverageMeter()
     id_loss = AverageMeter()
     tri_loss = AverageMeter()
@@ -312,22 +335,33 @@ def train(epoch):
         # Class-conditional SWD on DEEN's original (non-augmented) chunk ft1.
         # labs = [label1, label2, label1, label2] (4× layout for CPM); the first
         # 2× block is the original pair, matching ft1's [RGB ; IR] split.
-        if args.ccswd_weight > 0:
+        if use_ccswd:
             labs_orig = labs[:ft1.size(0)]
             loss_ccswd = criterion_ccswd(ft1, labs_orig)
+            if args.ccswd_learnable:
+                # Kendall (CVPR 2018) uncertainty-weighted loss:
+                #   L_w = 0.5 * exp(-log_var) * L_ccswd + 0.5 * log_var
+                # The log_var term prevents trivial collapse (log_var → +∞ would
+                # null the loss but be penalized by the second term).
+                ccswd_contrib = 0.5 * torch.exp(-ccswd_logvar) * loss_ccswd + 0.5 * ccswd_logvar
+            else:
+                ccswd_contrib = args.ccswd_weight * loss_ccswd
             if epoch == 0 and batch_idx == 0:
-                # One-shot diagnostic: confirm feat scale + raw cc_swd value.
-                # Compare to AGW's x_pool which gave ccSWD≈0.056 at init.
                 with torch.no_grad():
+                    eff_w = (0.5 * torch.exp(-ccswd_logvar)).item() if args.ccswd_learnable \
+                            else args.ccswd_weight
                     print('[ccswd-diag] ft1 shape={} mean_abs={:.4f} std={:.4f} '
-                          'raw_ccswd={:.6e} (× weight={} → {:.6e})'.format(
+                          'raw_ccswd={:.6e} eff_weight={:.4f} contrib={:.6e} '
+                          'log_var={:.4f} (learnable={})'.format(
                         tuple(ft1.shape), ft1.abs().mean().item(),
                         ft1.std().item(), loss_ccswd.item(),
-                        args.ccswd_weight, args.ccswd_weight * loss_ccswd.item()))
+                        eff_w, ccswd_contrib.item(),
+                        ccswd_logvar.item(), args.ccswd_learnable))
         else:
             loss_ccswd = torch.zeros((), device=feat1.device)
+            ccswd_contrib = torch.zeros((), device=feat1.device)
 
-        loss = loss_id + loss_tri + loss_cpm + loss_ort + args.ccswd_weight * loss_ccswd
+        loss = loss_id + loss_tri + loss_cpm + loss_ort + ccswd_contrib
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -338,7 +372,7 @@ def train(epoch):
         tri_loss.update(loss_tri.item(), 2 * input1.size(0))
         cpm_loss.update(loss_cpm.item(), 2 * input1.size(0))
         ort_loss.update(loss_ort.item(), 2 * input1.size(0))
-        if args.ccswd_weight > 0:
+        if use_ccswd:
             ccswd_loss.update(loss_ccswd.item(), 2 * input1.size(0))
         total += labels.size(0)
 
@@ -347,8 +381,13 @@ def train(epoch):
         end = time.time()
         if batch_idx % 50 == 0:
             extra = ''
-            if args.ccswd_weight > 0:
-                extra = ' ccSWD:{:.6f}'.format(ccswd_loss.avg)
+            if use_ccswd:
+                if args.ccswd_learnable:
+                    extra = ' ccSWD:{:.6f} log_var:{:.3f} eff_w:{:.4f}'.format(
+                        ccswd_loss.avg, ccswd_logvar.item(),
+                        0.5 * float(torch.exp(-ccswd_logvar).detach()))
+                else:
+                    extra = ' ccSWD:{:.6f}'.format(ccswd_loss.avg)
             print('Epoch: [{}][{}/{}] '
                   'Loss:{train_loss.val:.3f} '
                   'iLoss:{id_loss.val:.3f} '
@@ -364,8 +403,12 @@ def train(epoch):
     writer.add_scalar('tri_loss', tri_loss.avg, epoch)
     writer.add_scalar('cpm_loss', cpm_loss.avg, epoch)
     writer.add_scalar('ort_loss', ort_loss.avg, epoch)
-    if args.ccswd_weight > 0:
+    if use_ccswd:
         writer.add_scalar('ccswd_loss', ccswd_loss.avg, epoch)
+        if args.ccswd_learnable:
+            writer.add_scalar('ccswd_logvar', ccswd_logvar.item(), epoch)
+            writer.add_scalar('ccswd_eff_weight',
+                              0.5 * float(torch.exp(-ccswd_logvar).detach()), epoch)
     writer.add_scalar('lr', current_lr, epoch)
 
 
