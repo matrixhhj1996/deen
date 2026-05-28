@@ -202,14 +202,22 @@ class ClassCondSWDLoss(nn.Module):
     Requires K_v == K_t (true in AGW's p4n8 batch by construction).
     """
 
-    def __init__(self, n_projections: int = 64):
+    def __init__(self, n_projections: int = 64, l2_normalize: bool = False):
         super().__init__()
         self.n_projections = n_projections
+        # When True, l2-normalize features along D before SWD. This makes the
+        # loss *scale-invariant* across backbones — critical when plugging
+        # into networks with different pooling layers (AGW gm_pool ~10× larger
+        # magnitude than DEEN avgpool). Without normalization, the SWD value
+        # is ~50× smaller in DEEN and breaks adaptive-weighting schemes.
+        self.l2_normalize = l2_normalize
 
     def forward(self, feat: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         n_total = feat.shape[0]
         assert n_total % 2 == 0, f"expected even batch, got {n_total}"
         n = n_total // 2
+        if self.l2_normalize:
+            feat = F.normalize(feat, dim=1)
         feat_v, feat_t = feat[:n], feat[n:]
         lbl_v, lbl_t = labels[:n], labels[n:]
         D = feat.shape[1]

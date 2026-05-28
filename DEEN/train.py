@@ -239,7 +239,8 @@ criterion_id = nn.CrossEntropyLoss()
 loader_batch = args.batch_size * args.num_pos
 criterion_tri= OriTripletLoss(batch_size=loader_batch, margin=args.margin)
 criterion_cpm= CPMLoss(margin=0.2)
-criterion_ccswd = ClassCondSWDLoss(n_projections=args.ccswd_projections)
+criterion_ccswd = ClassCondSWDLoss(n_projections=args.ccswd_projections,
+                                   l2_normalize=True)
 # Learnable log_var for Kendall-style uncertainty weighting of ccswd.
 # Only used when --ccswd_learnable. Lives outside `net` so it's not part of
 # state_dict (cleaner checkpointing); a single scalar parameter.
